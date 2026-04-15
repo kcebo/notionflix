@@ -7,26 +7,29 @@ HEADERS = {
     "Content-Type": "application/json",
     "Notion-Version": "2022-06-28"
 }
+TMDB_IMG_BASE = "https://image.tmdb.org/t/p/original"
 
 def _request(method, endpoint, json=None):
+    """Motor central de peticiones para Notion."""
     url = f"{BASE_URL}{endpoint}"
     try:
         res = requests.request(method, url, headers=HEADERS, json=json)
         res.raise_for_status()
         return res.json()
     except requests.RequestException as e:
-        print(f"❌ Error en Notion API: {e}")
+        print(f"❌ Error en Notion API [{method.upper()} {endpoint}]: {e}")
         return None
 
 def get_pages(db_id):
-    """Devuelve todas las páginas de una base de datos"""
+    """Recupera todos los registros manejando la paginación de Notion."""
     all_pages = []
     payload = {}
     while True:
         data = _request("post", f"databases/{db_id}/query", json=payload)
-        if not data:
-            break
+        if not data: break
+        
         all_pages.extend(data.get("results", []))
+        
         if data.get("has_more"):
             payload["start_cursor"] = data.get("next_cursor")
         else:
@@ -34,18 +37,17 @@ def get_pages(db_id):
     return all_pages
 
 def update_page(page_id, properties):
-    """Actualiza propiedades de una página"""
+    """Actualiza propiedades de una página existente."""
     return _request("patch", f"pages/{page_id}", json={"properties": properties})
 
 def get_database_schema(db_id):
-    """Devuelve {nombre_propiedad: id_propiedad} para una base"""
+    """Mapea nombres de columnas con sus IDs internos."""
     data = _request("get", f"databases/{db_id}")
-    if not data:
-        return {}
+    if not data: return {}
     return {v["name"]: k for k, v in data["properties"].items()}
 
 def find_by_name(db_id, name, title_prop="Titulo"):
-    """Busca una página por nombre en una base específica"""
+    """Busca una página por su título para evitar duplicados."""
     payload = {
         "filter": {
             "property": title_prop,
@@ -57,61 +59,56 @@ def find_by_name(db_id, name, title_prop="Titulo"):
     return results[0] if results else None
 
 def create_collection_page(db_id, name, description=None, poster_url=None, prop_map=None):
-    """Crea una página de colección"""
-    title_key = prop_map.get("Titulo") if prop_map else "Titulo"
-    desc_key = prop_map.get("Descripcion") if prop_map else "Descripcion"
-    poster_key = prop_map.get("Poster") if prop_map else "Poster"
-
+    """Crea una página en la base de datos de Sagas/Colecciones."""
+    p = prop_map or {}
     properties = {
-        title_key: {"title": [{"text": {"content": name}}]}
+        p.get("Titulo", "Titulo"): {"title": [{"text": {"content": name}}]}
     }
-    if description and desc_key:
-        properties[desc_key] = {"rich_text": [{"text": {"content": description}}]}
-    if poster_url and poster_key:
-        properties[poster_key] = {"files": [{"name": "poster", "external": {"url": poster_url}}]}
+    
+    if description and p.get("Descripcion"):
+        properties[p["Descripcion"]] = {"rich_text": [{"text": {"content": description}}]}
+    
+    if poster_url and p.get("Poster"):
+        properties[p["Poster"]] = {"files": [{"name": "Poster", "external": {"url": poster_url}}]}
 
-    payload = {
-        "parent": {"database_id": db_id},
-        "properties": properties
-    }
-    return _request("post", "pages", json=payload)
+    return _request("post", "pages", json={"parent": {"database_id": db_id}, "properties": properties})
 
 def create_movie_page(db_id, movie_data, prop_map, saga_page=None, genres_dict=None, extra_properties=None):
+    """Construye el payload complejo para insertar una película."""
+    # Extracción limpia de datos
     title = movie_data.get("title") or movie_data.get("name") or "Sin título"
-    release_date = movie_data.get("release_date")
+    date_str = movie_data.get("release_date", "")
     overview = movie_data.get("overview")
     poster_path = movie_data.get("poster_path")
     genre_ids = movie_data.get("genre_ids", [])
 
-    properties = {}
+    props = {}
+    
+    # Mapeo dinámico usando f-strings y validaciones cortas
+    if key := prop_map.get("Titulo"):
+        props[key] = {"title": [{"text": {"content": title}}]}
+        
+    if key := prop_map.get("Estado"):
+        props[key] = {"select": {"name": "Vista"}}
+        
+    if (key := prop_map.get("Año")) and date_str:
+        props[key] = {"number": int(date_str.split("-")[0])}
+        
+    if (key := prop_map.get("Descripcion")) and overview:
+        props[key] = {"rich_text": [{"text": {"content": overview}}]}
+        
+    if (key := prop_map.get("Poster")) and poster_path:
+        props[key] = {"files": [{"name": title, "external": {"url": f"{TMDB_IMG_BASE}{poster_path}"}}]}
+        
+    if (key := prop_map.get("Generos")) and genres_dict:
+        names = [genres_dict[gid] for gid in genre_ids if gid in genres_dict]
+        if names:
+            props[key] = {"multi_select": [{"name": n} for n in names]}
+            
+    if (key := prop_map.get("Saga")) and saga_page:
+        props[key] = {"relation": [{"id": saga_page["id"]}]}
 
-    if prop_map.get("Titulo"):
-        properties[prop_map["Titulo"]] = {"title": [{"text": {"content": title}}]}
-    if prop_map.get("Estado"):
-        properties[prop_map["Estado"]] = {"select": {"name": "Vista"}}
-    if prop_map.get("Año") and release_date:
-        try:
-            properties[prop_map["Año"]] = {"number": int(release_date.split("-")[0])}
-        except ValueError:
-            pass
-    if prop_map.get("Descripcion") and overview:
-        properties[prop_map["Descripcion"]] = {"rich_text": [{"text": {"content": overview}}]}
-    if prop_map.get("Poster") and poster_path:
-        poster_url = f"https://image.tmdb.org/t/p/original{poster_path}"
-        properties[prop_map["Poster"]] = {"files": [{"name": title, "external": {"url": poster_url}}]}
-    if prop_map.get("Generos") and genre_ids and genres_dict:
-        valid_genres = [genres_dict.get(gid) for gid in genre_ids if genres_dict.get(gid)]
-        if valid_genres:
-            properties[prop_map["Generos"]] = {"multi_select": [{"name": g} for g in valid_genres]}
-    if saga_page and prop_map.get("Saga"):
-        properties[prop_map["Saga"]] = {"relation": [{"id": saga_page["id"]}]}
-
-    # 🔗 Agregar relaciones extra (como Elenco)
     if extra_properties:
-        properties.update(extra_properties)
+        props.update(extra_properties)
 
-    payload = {
-        "parent": {"database_id": db_id},
-        "properties": properties
-    }
-    return _request("post", "pages", json=payload)
+    return _request("post", "pages", json={"parent": {"database_id": db_id}, "properties": props})

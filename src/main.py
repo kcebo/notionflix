@@ -4,277 +4,167 @@ from notion import (
 )
 from tmdb import (
     search_movie, get_genres, get_movie,
-    get_collection, get_credits, get_person
+    get_collection, get_credits
 )
 from person import (
-    get_person_schema, find_person_by_name, create_person_page
+    get_person_schema, build_person_relations
 )
 from config import MOVIE_DB_ID, COLLECTION_DB_ID, PERSON_DB_ID
 
 def extract_title(page):
-    """Extrae el título de una página de película"""
-    title_prop = next((v for v in page["properties"].values() if "title" in v), None)
+    """Extrae el título de una página de película de forma segura."""
+    props = page.get("properties", {}).values()
+    title_prop = next((p for p in props if p["type"] == "title"), None)
     if title_prop and title_prop["title"]:
         return title_prop["title"][0]["text"]["content"]
     return None
 
 def has_poster(page, prop_map):
-    """Verifica si la página ya tiene imagen de póster"""
+    """Verifica si la página ya tiene imagen de póster para evitar retrabajo."""
     poster_key = prop_map.get("Poster")
     poster_prop = page["properties"].get(poster_key)
     return poster_prop and poster_prop.get("files")
 
-def build_properties(movie, title, prop_map, genre_dict):
-    """Construye las propiedades para actualizar una película en Notion"""
-    release_date = movie.get("release_date")
-    overview = movie.get("overview") or ""
-    poster_path = movie.get("poster_path")
-    poster_url = f"https://image.tmdb.org/t/p/original{poster_path}" if poster_path else ""
-    genres = [genre_dict.get(gid) for gid in movie.get("genre_ids", []) if genre_dict.get(gid)]
-
-    props = {}
-    if prop_map.get("Titulo"):
-        props[prop_map["Titulo"]] = {"title": [{"text": {"content": movie["original_title"]}}]}
-    if release_date and prop_map.get("Año"):
-        props[prop_map["Año"]] = {"number": int(release_date.split("-")[0])}
-    if overview and prop_map.get("Descripcion"):
-        props[prop_map["Descripcion"]] = {"rich_text": [{"text": {"content": overview}}]}
-    if poster_url and prop_map.get("Poster"):
-        props[prop_map["Poster"]] = {
-            "files": [{"name": title, "external": {"url": poster_url}}]
-        }
-    if genres and prop_map.get("Generos"):
-        props[prop_map["Generos"]] = {"multi_select": [{"name": g} for g in genres if g]}
-    return props
-
-def handle_collection(movie, prop_map, genre_dict, created_movies, created_collections,person_prop_map):
-    saga_key = prop_map.get("Saga")
-    elenco_key = prop_map.get("Elenco")
-    if not saga_key:
-        return None
-
+def handle_collection(movie, prop_map, genre_dict, created_movies, created_collections, person_map, created_people):
+    """Maneja la lógica de sagas y crea las películas que faltan automáticamente."""
     movie_full = get_movie(movie["id"])
-    collection_info = movie_full.get("belongs_to_collection")
-    if not collection_info:
+    col_info = movie_full.get("belongs_to_collection")
+    if not col_info:
         return None
 
-    collection_id = collection_info["id"]
-    collection_name = collection_info["name"]
-    collection_data = get_collection(collection_id)
+    col_name = col_info["name"]
+    col_data = get_collection(col_info["id"])
+    col_page = find_by_name(COLLECTION_DB_ID, col_name)
+    
+    if not col_page:
+        path = col_data.get("poster_path")
+        poster = f"https://image.tmdb.org/t/p/original{path}" if path else None
+        col_page = create_collection_page(COLLECTION_DB_ID, col_name, col_data.get("overview"), poster, prop_map)
+        if col_page:
+            created_collections.append(col_name)
 
-    collection_page = find_by_name(COLLECTION_DB_ID, collection_name)
-    if not collection_page:
-        collection_page = create_collection_page(
-            COLLECTION_DB_ID,
-            collection_name,
-            description=collection_data.get("overview"),
-            poster_url=f"https://image.tmdb.org/t/p/original{collection_data.get('poster_path')}"
-            if collection_data.get("poster_path") else None
-        )
-        if collection_page:
-            created_collections.append(collection_name)
-
-    for part in sorted(collection_data["parts"], key=lambda x: x.get("release_date", "")):
-        if part["id"] == movie["id"]:
-            continue
-        if find_by_name(MOVIE_DB_ID, part.get("title")):
+    for part in col_data.get("parts", []):
+        if part["id"] == movie["id"] or find_by_name(MOVIE_DB_ID, part.get("title")):
             continue
 
-        # Obtener créditos
         credits = get_credits(part["id"])
-        cast = credits.get("cast", [])
         crew = credits.get("crew", [])
-
-        actor_relations = []
-        director_relations = []
-
-        # Actor principal
-        if cast:
-            actor = cast[0]
-            name = actor.get("name")
-            person_id = actor.get("id")
-            person_data = get_person(person_id)
-            image_url = f"https://image.tmdb.org/t/p/original{person_data.get('profile_path')}" if person_data.get("profile_path") else None
-
-            existing = find_person_by_name(PERSON_DB_ID, name, title_prop=person_prop_map.get("Nombre"))
-            if not existing:
-                created = create_person_page(PERSON_DB_ID, name, role="Actor", prop_map=person_prop_map, image_url=image_url)
-                if created:
-                    actor_relations.append({"id": created["id"]})
-            else:
-                actor_relations.append({"id": existing["id"]})
-
-        # Director
+        cast = credits.get("cast", [])
         director = next((p for p in crew if p.get("job") == "Director"), None)
-        if director:
-            name = director.get("name")
-            person_id = director.get("id")
-            person_data = get_person(person_id)
-            image_url = f"https://image.tmdb.org/t/p/original{person_data.get('profile_path')}" if person_data.get('profile_path') else None
+        
+        # Separación de roles para las películas de la saga
+        a_ids = build_person_relations(PERSON_DB_ID, person_map, cast[:1], role="Actor")
+        d_ids = build_person_relations(PERSON_DB_ID, person_map, [director] if director else [], role="Director")
+        rel_ids = a_ids + d_ids
 
-            existing = find_person_by_name(PERSON_DB_ID, name, title_prop=person_prop_map.get("Nombre"))
-            if not existing:
-                created = create_person_page(PERSON_DB_ID, name, role="Director", prop_map=person_prop_map, image_url=image_url)
-                if created:
-                    director_relations.append({"id": created["id"]})
-            else:
-                director_relations.append({"id": existing["id"]})
+        # Trackeo de nombres para el resumen
+        for p in [cast[0] if cast else None, director]:
+            if p and p.get("name") and p["name"] not in created_people:
+                created_people.append(p["name"])
 
-        # Relación Elenco
-        extra_props = {}
-        if elenco_key and (actor_relations or director_relations):
-            extra_props[elenco_key] = {"relation": actor_relations + director_relations}
+        elenco_key = prop_map.get("Elenco")
+        extra = {elenco_key: {"relation": rel_ids}} if elenco_key and rel_ids else {}
 
-        # Crear película con relaciones
-        create_movie_page(
-            db_id=MOVIE_DB_ID,
-            movie_data=part,
-            prop_map=prop_map,
-            saga_page=collection_page,
-            genres_dict=genre_dict,
-            extra_properties=extra_props
-        )
-        created_movies.append(part.get("title"))
-
-    return {"relation": [{"id": collection_page["id"]}]} if collection_page else None
+        if create_movie_page(MOVIE_DB_ID, part, prop_map, col_page, genre_dict, extra):
+            created_movies.append(part.get("title"))
+    
+    return {"relation": [{"id": col_page["id"]}]} if col_page else None
 
 def mostrar_resumen(actualizadas, omitidas, fallidas, creadas, colecciones, personas):
+    """Tu función de resumen interactivo original."""
     print(f"\n📊 Resumen final:")
     print(f"  🎬 Películas creadas: {len(creadas)}")
     print(f"  📦 Colecciones creadas: {len(colecciones)}")
-    print(f"  👤 Personas creadas: {len(personas)}")
+    print(f"  👤 Personas procesadas: {len(personas)}")
     print(f"  ✅ Actualizadas: {len(actualizadas)}")
     print(f"  ⏩ Omitidas: {len(omitidas)}")
     print(f"  ❌ Fallidas: {len(fallidas)}")
 
-    ver_detalle = input("\n¿Desea ver el detalle de cada grupo? (s/n): ").strip().lower()
-    if ver_detalle == "s":
+    if input("\n¿Desea ver el detalle de cada grupo? (s/n): ").strip().lower() == "s":
         if creadas:
-            print("\n🎬 Películas creadas:")
-            for t in creadas:
-                print(f"  🎬 {t}")
+            print("\n🎬 Películas creadas:"); [print(f"  🎬 {t}") for t in creadas]
         if colecciones:
-            print("\n📦 Colecciones creadas:")
-            for c in colecciones:
-                print(f"  📦 {c}")
+            print("\n📦 Colecciones creadas:"); [print(f"  📦 {c}") for c in colecciones]
         if personas:
-            print("\n👤 Personas creadas:")
-            for p in personas:
-                print(f"  👤 {p}")
+            print("\n👤 Personas procesadas:"); [print(f"  👤 {p}") for p in personas]
         if actualizadas:
-            print("\n✅ Películas actualizadas:")
-            for t in actualizadas:
-                print(f"  ✅ {t}")
+            print("\n✅ Películas actualizadas:"); [print(f"  ✅ {t}") for t in actualizadas]
         if fallidas:
-            print("\n❌ Películas no encontradas o sin datos válidos:")
-            for t in fallidas:
-                print(f"  ❌ {t}")
-    else:
-        print(f"\n🧘 Detalle omitido{'-'*50}")
-
-    ver_omitidas = input("\n¿Desea ver las que se omitieron? (s/n): ").strip().lower()
-    if ver_omitidas == 's':
-        if omitidas:
-            print("\n⏩ Películas omitidas (ya tenían poster):")
-            for t in omitidas:
-                print(f"  ⏩ {t}")
+            print("\n❌ Películas no encontradas:"); [print(f"  ❌ {t}") for t in fallidas]
+    
+    if input("\n¿Desea ver las que se omitieron? (s/n): ").strip().lower() == 's' and omitidas:
+        print("\n⏩ Películas omitidas (ya tenían poster):")
+        for t in omitidas: print(f"  ⏩ {t}")
 
 def main():
     print("\n🚀 Iniciando NotionFlix...\n")
-    updated_titles = []
-    skipped_titles = []
-    failed_titles = []
-    created_movies = []
-    created_collections = []
-    created_people = []
+    upd, skip, fail, mov, col, pep = [], [], [], [], [], []
 
     prop_map = get_database_schema(MOVIE_DB_ID)
     genre_dict = get_genres()
-    person_prop_map = get_person_schema(PERSON_DB_ID)
+    person_map = get_person_schema(PERSON_DB_ID)
     pages = get_pages(MOVIE_DB_ID)
 
     for page in pages:
         title = extract_title(page)
-        if not title:
-            continue
+        if not title: continue
+        
         if has_poster(page, prop_map):
-            skipped_titles.append(title)
+            skip.append(title)
             continue
 
-        año_prop = page["properties"].get(prop_map.get("Año"))
-        año = año_prop["number"] if año_prop and año_prop["number"] else None
-
-        movie = search_movie(title, year=año, interactive=True)
+        print(f"🎬 Procesando: {title}")
+        año_num = page["properties"].get(prop_map.get("Año"), {}).get("number")
+        movie = search_movie(title, year=año_num, interactive=True)
+        
         if not movie:
-            failed_titles.append(title)
+            fail.append(title)
             continue
 
-        properties = build_properties(movie, title, prop_map, genre_dict)
-
-        # Relación con colección
-        saga_relation = handle_collection(movie, prop_map, genre_dict, created_movies, created_collections,person_prop_map)
-        saga_key = prop_map.get("Saga")
-        if saga_key and saga_relation:
-            properties[saga_key] = saga_relation
-
+        # 1. Gestionar Sagas y películas automáticas
+        saga_rel = handle_collection(movie, prop_map, genre_dict, mov, col, person_map, pep)
+        
+        # 2. Gestionar Personas de la película actual (Corregido: Roles separados)
         credits = get_credits(movie["id"])
         cast = credits.get("cast", [])
         crew = credits.get("crew", [])
-
-        actor_relations = []
-        director_relations = []
-
-        # Actor principal
-        if cast:
-            actor = cast[0]
-            name = actor.get("name")
-            person_id = actor.get("id")
-            person_data = get_person(person_id)
-            image_url = f"https://image.tmdb.org/t/p/original{person_data.get('profile_path')}" if person_data.get("profile_path") else None
-
-            existing = find_person_by_name(PERSON_DB_ID, name, title_prop=person_prop_map.get("Nombre"))
-            if not existing:
-                created = create_person_page(PERSON_DB_ID, name, role="Actor", prop_map=person_prop_map, image_url=image_url)
-                if created:
-                    actor_relations.append({"id": created["id"]})
-                    created_people.append(name)
-            else:
-                actor_relations.append({"id": existing["id"]})
-
-        # Director
         director = next((p for p in crew if p.get("job") == "Director"), None)
-        if director:
-            name = director.get("name")
-            person_id = director.get("id")
-            person_data = get_person(person_id)
-            image_url = f"https://image.tmdb.org/t/p/original{person_data.get('profile_path')}" if person_data.get("profile_path") else None
+        
+        actor_ids = build_person_relations(PERSON_DB_ID, person_map, cast[:1], role="Actor")
+        director_ids = build_person_relations(PERSON_DB_ID, person_map, [director] if director else [], role="Director")
+        actor_dir_ids = actor_ids + director_ids
 
-            existing = find_person_by_name(PERSON_DB_ID, name, title_prop=person_prop_map.get("Nombre"))
-            if not existing:
-                created = create_person_page(PERSON_DB_ID, name, role="Director", prop_map=person_prop_map, image_url=image_url)
-                if created:
-                    director_relations.append({"id": created["id"]})
-                    created_people.append(name)
-            else:
-                director_relations.append({"id": existing["id"]})
+        for p in [cast[0] if cast else None, director]:
+            if p and p.get("name") and p["name"] not in pep: pep.append(p["name"])
 
+        # 3. Armar el update de propiedades (Corregido: Incluye Géneros)
+        path = movie.get("poster_path")
+        poster_url = f"https://image.tmdb.org/t/p/original{path}" if path else ""
+        
+        props = {}
+        if k := prop_map.get("Titulo"): props[k] = {"title": [{"text": {"content": movie.get("title", title)}}]}
+        if (k := prop_map.get("Año")) and movie.get("release_date"): 
+            props[k] = {"number": int(movie["release_date"].split("-")[0])}
+        if (k := prop_map.get("Descripcion")) and movie.get("overview"): 
+            props[k] = {"rich_text": [{"text": {"content": movie["overview"]}}]}
+        if (k := prop_map.get("Poster")) and poster_url: 
+            props[k] = {"files": [{"name": title, "external": {"url": poster_url}}]}
+        
+        # Bloque de Géneros para película base
+        genre_ids = movie.get("genre_ids", [])
+        if (k := prop_map.get("Generos")) and genre_ids:
+            nombres = [genre_dict.get(gid) for gid in genre_ids if genre_dict.get(gid)]
+            if nombres: props[k] = {"multi_select": [{"name": n} for n in nombres]}
 
-        elenco_key = prop_map.get("Elenco")
-        if elenco_key and (actor_relations or director_relations):
-            properties[elenco_key] = {"relation": actor_relations + director_relations}
+        if (k := prop_map.get("Saga")) and saga_rel: props[k] = saga_rel
+        if (k := prop_map.get("Elenco")) and actor_dir_ids: props[k] = {"relation": actor_dir_ids}
 
-        if properties:
-            update_page(page["id"], properties)
-            updated_titles.append(title)
-            print(f"✅ Página '{title}' actualizada.\n{'-'*50}")
-        else:
-            print(f"⚠️ No hay datos válidos para actualizar en '{title}'.\n{'-'*50}")
-            failed_titles.append(title)
+        if update_page(page["id"], props):
+            upd.append(title)
+            print(f"✅ '{title}' sincronizada.")
 
-    mostrar_resumen(updated_titles, skipped_titles, failed_titles,
-                    created_movies, created_collections, created_people)
-
-    print("\n🏁 Vuelva pronto ! -- NotionFlix\n")
+    mostrar_resumen(upd, skip, fail, mov, col, pep)
+    print("\n🏁 Vuelva pronto! -- NotionFlix\n")
 
 if __name__ == "__main__":
     main()
